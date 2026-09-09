@@ -9,7 +9,7 @@ import streamlit as st
 from agents import load_workbook, run_pipeline, SNAPSHOT_DATE
 from llm import generate_root_cause, copilot_answer, copilot_workbook_answer, enabled
 
-st.set_page_config(page_title="NexusChain AI Control Tower", page_icon="◈", layout="wide")
+st.set_page_config(page_title="IntelliWarehouse AI Control Tower", page_icon="◈", layout="wide")
 
 st.markdown("""
 <style>
@@ -34,14 +34,14 @@ if "ai_cache" not in st.session_state: st.session_state.ai_cache={}
 
 st.markdown("""
 <div class="hero">
-<h1>◈ NexusChain AI Control Tower</h1>
+<h1>◈IntelliWarehouse AI Control Towe</h1>
 <p>Detect → Correlate → Explain → Impact → Approve</p>
 </div>
 """, unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Control Center")
-    default_path = Path(__file__).parent / "Warehouse_AI_Hackathon_Synthetic_Dataset_FINAL 2.xlsx"
+    default_path = Path(__file__).parent / "Warehouse_AI_Hackathon_Synthetic_Dataset_FINAL_2.xlsx"
     uploaded=st.file_uploader("Upload warehouse workbook",type=["xlsx"])
     path=uploaded if uploaded is not None else default_path
     st.caption("Snapshot: 05 Sep 2026")
