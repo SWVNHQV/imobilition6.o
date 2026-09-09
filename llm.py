@@ -745,6 +745,52 @@ Do not invent information.
         )
         missing_rows = dq.loc[mask].to_dict("records")
 
+    # ---------------------------------------------------------------
+    # Deterministic workbook-wide inventory questions
+    # ---------------------------------------------------------------
+    # Counts/quantities must come from the workbook, not from an LLM
+    # interpretation.  This prevents a broad question such as
+    # "How many expired inventory?" from being answered using the
+    # currently selected material/finding only.
+    asks_expired = (
+        "expired" in qn
+        and any(term in qn for term in [
+            "inventory", "stock", "quantity", "qty", "units",
+            "howmany", "howmuch", "total", "list", "which"
+        ])
+    )
+
+    if asks_expired and "expiry" not in qn:
+        inv = data.get("Inventory_Stock")
+        if inv is not None and not inv.empty and {"Material", "Plant", "Qty On Hand", "Batch Expiry"}.issubset(inv.columns):
+            snapshot = pd.Timestamp("2026-09-05")
+            expiry = pd.to_datetime(inv["Batch Expiry"], errors="coerce")
+            qty = pd.to_numeric(inv["Qty On Hand"], errors="coerce").fillna(0)
+            mask = expiry < snapshot
+            # Match the anomaly rule: only expired stock with positive on-hand quantity.
+            expired = inv.loc[mask & (qty > 0), ["Material", "Plant", "Qty On Hand", "Batch Expiry"]].copy()
+            expired["Qty On Hand"] = pd.to_numeric(expired["Qty On Hand"], errors="coerce").fillna(0)
+            expired = expired.sort_values("Batch Expiry")
+            total_qty = int(expired["Qty On Hand"].sum())
+
+            lines = [
+                "### Answer",
+                f"There are **{len(expired)} expired inventory records**, totaling **{total_qty:,} units** as of the **2026-09-05 snapshot**.",
+                "",
+                "### Expired inventory",
+            ]
+            for _, r in expired.iterrows():
+                exp = pd.Timestamp(r["Batch Expiry"]).strftime("%Y-%m-%d")
+                lines.append(
+                    f"- **{r['Material']}** · Plant **{r['Plant']}** · **{int(r['Qty On Hand']):,} units** · expired **{exp}**"
+                )
+            lines.extend([
+                "",
+                "### Important",
+                "This is a workbook-wide Copilot answer. It is not limited to the material or finding currently selected elsewhere in the app.",
+            ])
+            return "\n".join(lines)
+
     asks_missing = any(
         term in qn
         for term in [
@@ -780,25 +826,59 @@ Do not invent information.
 
         return "\n".join(lines)
 
+    # For a genuinely general Copilot question, provide the LLM with the
+    # complete loaded workbook, not only the current selection or finding
+    # summaries.  This lets Copilot answer questions such as:
+    # - How many materials/vendors/deliveries/POs are there?
+    # - Which vendors are blocked?
+    # - What is the total stock?
+    # - Which deliveries are overdue?
+    # - Show records matching a material/plant/status/value.
+    # - What are the biggest operational risks?
+    # The deterministic agents still establish DQ/anomaly facts; the LLM
+    # explains and answers the operator's natural-language question.
+    full_workbook = {}
+    for sheet_name, df in data.items():
+        if df is None:
+            continue
+        full_workbook[sheet_name] = df.to_dict("records")
+
     context = {
         "question": q,
+        "snapshot_date": "2026-09-05",
         "data_row_counts": {
             k: len(v) for k, v in data.items()
         },
         "data_quality_findings": dq.to_dict("records") if not dq.empty else [],
         "anomaly_summary": an_counts,
         "data_quality_summary": dq_counts,
+        "full_workbook_records": full_workbook,
     }
 
     if not enabled():
+        # Give a useful deterministic answer for common general questions
+        # even when the OpenAI key is unavailable.  More complex natural
+        # language questions still need the LLM.
+        inventory = data.get("Inventory_Stock")
+        deliveries = data.get("Deliveries_Dispatch")
+        pos = data.get("Purchase_Replenish")
+        materials = data.get("Material_Master")
+        vendors = data.get("Vendor_Master")
+
+        if any(term in qn for term in ["how many materials", "number of materials", "count of materials"]):
+            return f"### Answer\nThere are **{len(materials) if materials is not None else 0} material master records** in the workbook."
+        if any(term in qn for term in ["how many vendors", "number of vendors", "count of vendors"]):
+            return f"### Answer\nThere are **{len(vendors) if vendors is not None else 0} vendor master records** in the workbook."
+        if any(term in qn for term in ["how many deliveries", "number of deliveries", "count of deliveries"]):
+            return f"### Answer\nThere are **{len(deliveries) if deliveries is not None else 0} delivery records** in the workbook."
+        if any(term in qn for term in ["how many purchase orders", "how many pos", "number of purchase orders", "count of purchase orders"]):
+            return f"### Answer\nThere are **{len(pos) if pos is not None else 0} purchase-order records** in the workbook."
+
         return (
             "### Answer\n"
-            f"I checked the loaded workbook. The Data Quality Agent found "
-            f"**{len(dq)}** findings and the Anomaly Agent found "
-            f"**{len(anomalies)}** findings.\n\n"
-            "You can ask about a specific DQ ID, a field such as **Base UoM**, "
-            "a material, delivery, PO, vendor, shortage, expired stock, "
-            "or another workbook topic."
+            f"I checked the loaded workbook. The Data Quality Agent found **{len(dq)}** findings and the Anomaly Agent found **{len(anomalies)}** findings.\n\n"
+            "For general natural-language questions, Copilot uses the complete six-sheet workbook as its evidence source. "
+            "The OpenAI connection is currently unavailable, so I cannot generate the full natural-language answer for this question yet."
         )
 
     model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
@@ -808,18 +888,29 @@ Do not invent information.
 Operator question:
 {q}
 
-Workbook-wide evidence:
+Complete workbook and control-tower evidence:
 {json.dumps(context, indent=2, default=str)}
 
-Answer directly using only supplied evidence.
+You are answering a general-purpose warehouse control-tower Copilot question.
+Use the COMPLETE workbook records above as the primary source. Do not limit the
+answer to the currently selected finding, material, case, or UI element.
 
-Important:
-- Treat field names case-insensitively.
-- Base UoM, base uom and BASE UOM mean the same field.
-- If the question asks for a count, provide the count.
-- If the question asks for records, show actual IDs and actual values.
-- If the question refers to a specific DQ ID, explain that finding rather than giving a generic workbook summary.
-- Do not invent information.
+You can answer questions about ANY of these six operational sheets:
+Material_Master, Inventory_Stock, Warehouse_Bin, Deliveries_Dispatch,
+Purchase_Replenish, Vendor_Master. Data_Dictionary may be used to explain fields.
+
+Rules:
+- Answer the actual question directly first.
+- Treat field names case-insensitively and understand natural-language synonyms.
+- For counts, totals, averages, comparisons, rankings, or date logic, calculate from the supplied workbook records.
+- For lists, show actual record IDs/materials/vendors and actual values from the workbook.
+- For questions about DQ/anomalies, use the deterministic findings supplied and distinguish confirmed facts from inference.
+- If the operator asks a workbook-wide question, consider ALL relevant rows, not only the selected record.
+- If the operator asks about a specific entity, connect relevant records across sheets when supported by keys.
+- Preserve exact IDs, quantities, statuses, dates and field values.
+- Never invent a record, value, date, relationship, or business rule.
+- If the workbook does not contain enough evidence, say exactly what is missing.
+- Keep the answer concise but useful, with a small table/list when that makes the answer clearer.
 """
 
     response = client.responses.create(
