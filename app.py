@@ -9,7 +9,7 @@ import streamlit as st
 from agents import load_workbook, run_pipeline, SNAPSHOT_DATE
 from llm import generate_root_cause, copilot_answer, copilot_workbook_answer, enabled
 
-st.set_page_config(page_title="IntelliWarehouse AI Control Tower", page_icon="◈", layout="wide")
+st.set_page_config(page_title="NexusChain AI Control Tower", page_icon="◈", layout="wide")
 
 st.markdown("""
 <style>
@@ -34,50 +34,51 @@ if "ai_cache" not in st.session_state: st.session_state.ai_cache={}
 
 st.markdown("""
 <div class="hero">
-<h1>◈ IntelliWarehouse AI Control Tower</h1>
+<h1>◈ NexusChain AI Control Tower</h1>
 <p>Detect → Correlate → Explain → Impact → Approve</p>
 </div>
 """, unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Control Center")
-    default_path = Path(__file__).parent / "Warehouse_AI_Hackathon_Synthetic_Dataset_FINAL_2.xlsx"
+    default_path = Path(__file__).parent / "Warehouse_AI_Hackathon_Synthetic_Dataset_FINAL 2.xlsx"
     uploaded=st.file_uploader("Upload warehouse workbook",type=["xlsx"])
     path=uploaded if uploaded is not None else default_path
     st.caption("Snapshot: 05 Sep 2026")
-    model_name = os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')
+    model_name = st.secrets.get('OPENAI_MODEL', os.getenv('OPENAI_MODEL', 'gpt-5'))
     if enabled():
         st.success(f"LLM enabled · {model_name}")
     else:
         st.warning("LLM not enabled — deterministic evidence-grounded fallback is active.")
-        st.caption("Create a file named .env beside app.py with OPENAI_API_KEY=your_key, then restart Streamlit.")
+        st.caption("Add OPENAI_API_KEY in Streamlit Cloud → Settings → Secrets, then reboot the app.")
     st.divider()
     st.caption("Governance")
     st.caption("Human approval required · Simulated actions · Audit retained")
 
 try:
     raw=load_workbook(path)
-    data, graph, dq, anomalies, cases=run_pipeline(raw)# Initialize approval queue from current RCA cases
-    current_case_ids = set(cases["case_id"].astype(str)) if not cases.empty else set()
-
-    # Remove approval states for cases no longer in the current workbook
-    for cid in list(st.session_state.actions.keys()):
-      if cid not in current_case_ids:
-        del st.session_state.actions[cid]
-
-    # Add every RCA case as Pending unless a human already decided
-    for _, case in cases.iterrows():
-      cid = str(case["case_id"])
-      if cid not in st.session_state.actions:
-        st.session_state.actions[cid] = {
-            "status": "Pending",
-            "approver": "",
-            "note": "",
-            "action": case["recommended_action"],
-        }
+    data, graph, dq, anomalies, cases=run_pipeline(raw)
 except Exception as e:
     st.error(f"Could not load workbook: {e}")
     st.stop()
+
+# Keep every current RCA case in the human approval queue.
+# The default status is Pending; approval/rejection is persisted in session state
+# and therefore survives Streamlit reruns. No action is executed automatically.
+if cases is not None and not cases.empty:
+    current_case_ids = set()
+    for _, _case in cases.iterrows():
+        _cid = str(_case.get("case_id", "")).strip()
+        if not _cid:
+            continue
+        current_case_ids.add(_cid)
+        if _cid not in st.session_state.actions:
+            st.session_state.actions[_cid] = {
+                "status": "Pending",
+                "approver": "",
+                "note": "",
+                "action": _case.get("recommended_action", "Review the linked records before corrective action."),
+            }
 
 def evidence_text(e):
     if not isinstance(e, dict):
@@ -186,7 +187,10 @@ with tabs[0]:
     c1.metric("Data quality", len(dq))
     c2.metric("Process anomalies", len(anomalies))
     c3.metric("Root-cause cases", len(cases))
-    pending = sum(1 for v in st.session_state.actions.values() if v.get("status") == "Pending")
+    pending = sum(
+        1 for _, _case in cases.iterrows()
+        if st.session_state.actions.get(str(_case.get("case_id", "")).strip(), {}).get("status") == "Pending"
+    ) if cases is not None and not cases.empty else 0
     c4.metric("Pending approval", pending)
 
     st.markdown("### Data Quality")
