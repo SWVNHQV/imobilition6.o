@@ -3,14 +3,18 @@ from __future__ import annotations
 import os
 import json
 import re
-from pathlib import Path
+import streamlit as st
 
-# Load the project's local .env automatically when present.
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).with_name(".env"), override=False)
-except ImportError:
-    pass
+
+def _secret(name: str, default=None):
+    """Read Streamlit Cloud Secrets first, then local environment variables."""
+    try:
+        value = st.secrets.get(name)
+        if value not in (None, ""):
+            return value
+    except Exception:
+        pass
+    return os.getenv(name, default)
 
 
 SYSTEM_PROMPT = """
@@ -35,19 +39,19 @@ Rules:
 
 
 def enabled():
-    return bool(os.getenv("OPENAI_API_KEY"))
+    return bool(_secret("OPENAI_API_KEY"))
 
 
 def _client():
     from openai import OpenAI
-    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    return OpenAI(api_key=_secret("OPENAI_API_KEY"))
 
 
 def generate_root_cause(case: dict, model: str | None = None) -> str:
     if not enabled():
         return fallback_root_cause(case)
 
-    model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
     client = _client()
 
     prompt = f"""
@@ -92,7 +96,7 @@ def copilot_answer(question: str, case: dict, model: str | None = None) -> str:
     if not enabled():
         return fallback_copilot(question, case)
 
-    model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
     client = _client()
 
     prompt = f"""
@@ -505,7 +509,7 @@ def copilot_workbook_answer(question: str, dq, anomalies, data, model: str | Non
 
             return "\n".join(lines)
 
-        model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
         client = _client()
 
         prompt = f"""
@@ -582,7 +586,7 @@ Do not invent any information.
 
             return "\n".join(lines)
 
-        model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
         client = _client()
 
         prompt = f"""
@@ -690,7 +694,7 @@ Do not invent missing records.
 
             return "\n".join(lines)
 
-        model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
         client = _client()
 
         prompt = f"""
@@ -797,7 +801,7 @@ Do not invent information.
             "or another workbook topic."
         )
 
-    model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
     client = _client()
 
     prompt = f"""
