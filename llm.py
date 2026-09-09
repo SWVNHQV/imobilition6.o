@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import re
+from pathlib import Path
 import streamlit as st
 
 
@@ -97,7 +98,7 @@ def _load_copilot_workbook():
     import pandas as pd
 
     candidates = [
-        Path(__file__).with_name("Warehouse_AI_Hackathon_Synthetic_Dataset_FINAL_2.xlsx"),
+        Path(__file__).with_name("Warehouse_AI_Hackathon_Synthetic_Dataset_FINAL 2.xlsx"),
         Path(__file__).with_name("Warehouse_AI_Hackathon_Synthetic_Dataset_FINAL_2.xlsx"),
     ]
     workbook = next((p for p in candidates if p.exists()), None)
