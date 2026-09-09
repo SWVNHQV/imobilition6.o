@@ -92,37 +92,138 @@ In Evidence Chain, explicitly name the source sheet and the exact record/field v
     return response.output_text.strip()
 
 
-def copilot_answer(question: str, case: dict, model: str | None = None) -> str:
+def _load_copilot_workbook():
+    """Load the complete six-sheet workbook so Copilot is never limited to a correlated case."""
+    import pandas as pd
+
+    candidates = [
+        Path(__file__).with_name("Warehouse_AI_Hackathon_Synthetic_Dataset_FINAL 2.xlsx"),
+        Path(__file__).with_name("Warehouse_AI_Hackathon_Synthetic_Dataset_FINAL_2.xlsx"),
+    ]
+    workbook = next((p for p in candidates if p.exists()), None)
+    if workbook is None:
+        return {}
+
+    try:
+        sheets = pd.read_excel(workbook, sheet_name=None)
+        wanted = {
+            "Material_Master", "Inventory_Stock", "Warehouse_Bin",
+            "Deliveries_Dispatch", "Purchase_Replenish", "Vendor_Master"
+        }
+        return {k: v for k, v in sheets.items() if k in wanted}
+    except Exception:
+        return {}
+
+
+def _is_general_copilot_question(question: str) -> bool:
+    """Return True unless the operator explicitly asks for RCA/explanation of a finding/case."""
+    qn = _norm(question)
+    rca_terms = [
+        "rootcause", "root cause", "whyisthisfinding", "explainthisfinding",
+        "explainfinding", "explainanomaly", "explaincase", "explainthiscase",
+        "whyisthisanomaly", "whyisthiscase", "whyflagged", "whywasthisflagged",
+    ]
+    return not any(term.replace(" ", "") in qn for term in rca_terms)
+
+
+def copilot_answer(question: str, case: dict | None = None, model: str | None = None) -> str:
+    """General-purpose Copilot entry point.
+
+    IMPORTANT: this function intentionally loads the complete workbook.  The
+    `case` argument is optional supporting context for an explicit RCA/finding
+    question; it is NOT the primary evidence source for normal Copilot queries.
+    This keeps questions like "how many expired inventory?" workbook-wide even
+    when the UI happens to pass a selected finding/case.
+    """
+    workbook = _load_copilot_workbook()
+    case = case or {}
+
     if not enabled():
+        # Delegate to the workbook-aware deterministic engine whenever possible.
+        try:
+            import pandas as pd
+            dq = pd.DataFrame(case.get("related_data_quality_findings", []))
+            anomalies = pd.DataFrame(case.get("related_anomaly_findings", []))
+            if workbook:
+                return copilot_workbook_answer(question, dq, anomalies, workbook, model)
+        except Exception:
+            pass
         return fallback_copilot(question, case)
 
     model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
     client = _client()
 
+    workbook_records = {
+        sheet: df.to_dict("records")
+        for sheet, df in workbook.items()
+    }
+
+    explicit_rca = not _is_general_copilot_question(question)
+    context = {
+        "operator_question": question,
+        "snapshot_date": "2026-09-05",
+        "complete_workbook": workbook_records,
+    }
+
+    if explicit_rca and case:
+        context["selected_case_or_finding_supporting_context"] = case
+
     prompt = f"""
+You are the general-purpose Warehouse Control Tower Copilot.
+
 Operator question:
 {question}
 
-Correlated case:
-{json.dumps(case, indent=2, default=str)}
+Evidence:
+{json.dumps(context, indent=2, default=str)}
 
-Answer the operator directly.
+PRIMARY RULE:
+Answer the operator's actual question using the COMPLETE SIX-SHEET WORKBOOK
+above. Never assume that the currently selected finding, anomaly, material, or
+correlated case defines the scope of the question.
 
-Start with the conclusion.
-Then explain the exact evidence.
-Then explain related operational impact.
-Then give the safest next step.
+For normal/general questions, the workbook is the primary and authoritative
+scope. The selected case/finding is only supporting context and must NOT narrow
+the answer.
 
-Never invent information that is not in the supplied case.
-Keep exact IDs, quantities and dates.
+For an explicit RCA/finding/case explanation, you may use the selected case as
+supporting context, but verify it against the complete workbook records.
+
+You can answer questions about:
+- Material_Master
+- Inventory_Stock
+- Warehouse_Bin
+- Deliveries_Dispatch
+- Purchase_Replenish
+- Vendor_Master
+
+Rules:
+1. For counts, totals, averages, comparisons, rankings and date logic, calculate
+   from the supplied workbook records.
+2. For lists, show actual IDs/materials/vendors and exact workbook values.
+3. Understand natural-language synonyms and case-insensitive field names.
+4. If the question is workbook-wide, inspect ALL relevant rows.
+5. If the question names a material/vendor/PO/delivery, find it in the workbook
+   and connect related records across sheets using actual keys.
+6. Do not use correlated-case evidence as a substitute for the workbook.
+7. Never invent quantities, IDs, dates, statuses, relationships or events.
+8. Preserve exact workbook values.
+9. Distinguish confirmed facts, deterministic calculations and inference.
+10. If a requested value is unavailable, say so rather than substituting a
+    selected case's value.
+11. Start with a direct answer. Use a compact table/list when useful.
+
+Example:
+If the operator asks "How many expired inventory?", calculate expiration across
+ALL Inventory_Stock rows using Batch Expiry relative to the 2026-09-05 snapshot.
+Do not answer from a selected material such as MAT-100056.
 """
 
     response = client.responses.create(
         model=model,
         instructions=SYSTEM_PROMPT,
-        input=prompt
+        input=prompt,
     )
-
     return response.output_text.strip()
 
 
