@@ -34,7 +34,7 @@ if "ai_cache" not in st.session_state: st.session_state.ai_cache={}
 
 st.markdown("""
 <div class="hero">
-<h1>◈IntelliWarehouse AI Control Towe</h1>
+<h1>◈IntelliWarehouse AI Control Tower</h1>
 <p>Detect → Correlate → Explain → Impact → Approve</p>
 </div>
 """, unsafe_allow_html=True)
