@@ -5,6 +5,7 @@ import json
 import re
 from pathlib import Path
 import streamlit as st
+import httpx
 
 
 def _secret(name: str, default=None):
@@ -39,58 +40,183 @@ Rules:
 """
 
 
-def enabled():
-    return bool(_secret("OPENAI_API_KEY"))
+def get_token() -> str:
+    """Get a VW Group IDP access token using client credentials."""
+    client_id = _secret("VW_IDP_CLIENT_ID")
+    client_secret = _secret("VW_IDP_CLIENT_SECRET")
+
+    if not client_id or not client_secret:
+        raise RuntimeError(
+            "Missing VW_IDP_CLIENT_ID or VW_IDP_CLIENT_SECRET. "
+            "Configure them in Streamlit Secrets or environment variables."
+        )
+
+    url = (
+        "https://idp.cloud.vwgroup.com/"
+        "auth/realms/kums-mfa/"
+        "protocol/openid-connect/token"
+    )
+
+    response = httpx.post(
+        url,
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+        },
+        timeout=30.0,
+    )
+    if response.status_code != 200:
+        detail = ""
+        try:
+            payload = response.json()
+            detail = str(payload.get("error_description") or payload.get("error") or "").strip()
+        except Exception:
+            detail = ""
+        msg = f"VW IDP token request failed (HTTP {response.status_code})."
+        if detail:
+            msg += f" {detail}"
+        raise RuntimeError(msg)
+
+    token_data = response.json()
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        raise RuntimeError("VW IDP did not return an access_token.")
+
+    return access_token
+
+
+def enabled() -> bool:
+    """Return True when all VW LLMaaS credentials are configured."""
+    return bool(
+        _secret("VW_IDP_CLIENT_ID")
+        and _secret("VW_IDP_CLIENT_SECRET")
+        and _secret("LLM_API_CLIENT_ID")
+    )
+
+
+
+def llm_configured() -> bool:
+    """Public helper for the UI to check whether LLMaaS credentials exist."""
+    return enabled()
 
 
 def _client():
+    """Create the OpenAI-compatible VW Group LLMaaS client."""
     from openai import OpenAI
-    return OpenAI(api_key=_secret("OPENAI_API_KEY"))
+
+    token = get_token()
+    llm_api_client_id = _secret("LLM_API_CLIENT_ID")
+    base_url = _secret(
+        "LLM_API_BASE_URL",
+        "https://llmapi.ai.vwgroup.com",
+    )
+
+    headers = {
+        "X-LLM-API-CLIENT-ID": f"Bearer {llm_api_client_id}"
+    }
+
+    return OpenAI(
+        api_key=token,
+        base_url=base_url,
+        default_headers=headers,
+    )
 
 
-def generate_root_cause(case: dict, model: str | None = None) -> str:
+def _llm_complete(
+    prompt: str,
+    system_prompt: str = SYSTEM_PROMPT,
+    model: str | None = None,
+) -> str:
+    """Send a request to VW Group LLMaaS using Chat Completions."""
     if not enabled():
-        return fallback_root_cause(case)
+        raise RuntimeError("VW LLMaaS credentials are not configured.")
 
     model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
     client = _client()
 
-    prompt = f"""
-Analyze this correlated warehouse case as a senior warehouse root-cause analyst.
-
-The JSON contains both deterministic calculations and the underlying connected workbook records.
-The six source sheets in `evidence` are the source of truth: Material_Master, Inventory_Stock,
-Warehouse_Bin, Deliveries_Dispatch, Purchase_Replenish, and Vendor_Master.
-
-{json.dumps(case, indent=2, default=str)}
-
-Reasoning requirements:
-1. Read the connected records across all available sheets before forming the root cause.
-2. Reconcile the material, plant, vendor, delivery, PO and inventory relationships using only supplied keys.
-3. Use deterministic metrics for arithmetic, but verify the meaning against the underlying records.
-4. Do not simply repeat `root_cause`; independently explain why the evidence supports that conclusion.
-5. Identify the primary root cause first, then contributing factors, then symptoms.
-6. Never invent a record. If a sheet has zero linked records, say that it has no linked evidence.
-7. Preserve exact IDs, quantities, dates, statuses, field names and values.
-8. For inventory, distinguish physical on-hand, blocked quantity, usable available quantity, inbound quantity and shortage.
-
-Write exactly these sections:
-### Root Cause
-### Evidence Chain
-### Business Impact
-### Recommended Action
-### Confidence
-
-In Evidence Chain, explicitly name the source sheet and the exact record/field values supporting each important conclusion.
-"""
-
-    response = client.responses.create(
+    completion = client.chat.completions.create(
         model=model,
-        instructions=SYSTEM_PROMPT,
-        input=prompt
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        stream=False,
     )
 
-    return response.output_text.strip()
+    answer = completion.choices[0].message.content
+
+    if not answer:
+        raise RuntimeError("VW LLMaaS returned an empty response.")
+
+    return answer.strip()
+
+
+def generate_root_cause(case: dict, model: str | None = None) -> str:
+    """Generate a concise, evidence-grounded RCA decision brief using VW Group LLMaaS."""
+    if not enabled():
+        raise RuntimeError(
+            "VW Group LLMaaS is not configured. Set VW_IDP_CLIENT_ID, "
+            "VW_IDP_CLIENT_SECRET, and LLM_API_CLIENT_ID in Streamlit Secrets."
+        )
+
+    model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
+
+    prompt = f"""
+Act as a senior warehouse root-cause analyst.
+
+Your job is to transform the supplied correlated case into a concise decision brief for a
+warehouse operator. The workbook evidence is the source of truth.
+
+CASE DATA:
+{json.dumps(case, indent=2, default=str)}
+
+ANALYSIS RULES
+1. Use ONLY the supplied case data and linked workbook records.
+2. Reconcile the relationships across Material_Master, Inventory_Stock, Warehouse_Bin,
+   Deliveries_Dispatch, Purchase_Replenish, and Vendor_Master only when the supplied keys support them.
+3. Preserve exact IDs, quantities, dates, statuses, and field values.
+4. Distinguish:
+   - confirmed facts directly observed in records,
+   - deterministic calculations,
+   - the inferred primary root cause,
+   - contributing factors and symptoms.
+5. Do not invent missing data.
+6. Do not repeat the same evidence in multiple sections.
+7. For inventory, clearly distinguish physical on-hand, blocked quantity, usable available quantity,
+   inbound quantity, demand, and shortage.
+8. Recommendations are proposals only. Never claim an action has already been executed.
+9. Keep the language direct, operational, and easy to scan.
+10. Prefer concrete statements such as:
+    "Demand is 235 while usable stock is 0, creating a 235-unit shortage."
+    Do not use vague phrases such as "there appears to be an issue."
+
+OUTPUT FORMAT
+Return exactly:
+
+### Primary Root Cause
+One concise paragraph of 1–3 sentences. State the main causal chain using the most important
+confirmed values. Do NOT merely copy the existing `root_cause` text; compress and clarify it.
+
+### Evidence
+Use 3–5 bullet points. Each bullet should contain one concrete fact and, when available,
+the source sheet and relevant ID/field.
+
+### Impact
+One concise paragraph containing the most important operational impact, including the supplied
+impact score/severity and the key shortage/delivery/capacity consequence.
+
+### Recommended Action
+One concise sentence or two short bullets. Actions must be proposed, not described as completed.
+
+### Confidence
+One sentence: High / Medium / Low, with a brief reason based on evidence coverage.
+
+Do not add any other headings, introduction, conclusion, or disclaimer.
+"""
+    return _llm_complete(prompt=prompt, system_prompt=SYSTEM_PROMPT, model=model)
 
 
 def _load_copilot_workbook():
@@ -152,7 +278,6 @@ def copilot_answer(question: str, case: dict | None = None, model: str | None = 
         return fallback_copilot(question, case)
 
     model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
-    client = _client()
 
     workbook_records = {
         sheet: df.to_dict("records")
@@ -220,12 +345,11 @@ ALL Inventory_Stock rows using Batch Expiry relative to the 2026-09-05 snapshot.
 Do not answer from a selected material such as MAT-100056.
 """
 
-    response = client.responses.create(
+    return _llm_complete(
+        prompt=prompt,
+        system_prompt=SYSTEM_PROMPT,
         model=model,
-        instructions=SYSTEM_PROMPT,
-        input=prompt,
     )
-    return response.output_text.strip()
 
 
 # -------------------------------------------------------------------
@@ -612,7 +736,6 @@ def copilot_workbook_answer(question: str, dq, anomalies, data, model: str | Non
             return "\n".join(lines)
 
         model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
-        client = _client()
 
         prompt = f"""
 Operator question:
@@ -643,12 +766,11 @@ Give a practical review/remediation proposal. Do not claim execution.
 Do not invent any information.
 """
 
-        response = client.responses.create(
+        return _llm_complete(
+            prompt=prompt,
+            system_prompt=SYSTEM_PROMPT,
             model=model,
-            instructions=SYSTEM_PROMPT,
-            input=prompt
         )
-        return response.output_text.strip()
 
     # ---------------------------------------------------------------
     # 2. Field-level question: "Base UoM", "base uom", "BASE UOM"
@@ -689,7 +811,6 @@ Do not invent any information.
             return "\n".join(lines)
 
         model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
-        client = _client()
 
         prompt = f"""
 Operator question:
@@ -716,12 +837,11 @@ Keep exact issue IDs, records and actual values.
 Do not invent missing records.
 """
 
-        response = client.responses.create(
+        return _llm_complete(
+            prompt=prompt,
+            system_prompt=SYSTEM_PROMPT,
             model=model,
-            instructions=SYSTEM_PROMPT,
-            input=prompt
         )
-        return response.output_text.strip()
 
     # ---------------------------------------------------------------
     # 3. Material/entity investigation
@@ -797,7 +917,6 @@ Do not invent missing records.
             return "\n".join(lines)
 
         model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
-        client = _client()
 
         prompt = f"""
 Operator question:
@@ -817,12 +936,11 @@ Use exact values and IDs.
 Do not invent information.
 """
 
-        response = client.responses.create(
+        return _llm_complete(
+            prompt=prompt,
+            system_prompt=SYSTEM_PROMPT,
             model=model,
-            instructions=SYSTEM_PROMPT,
-            input=prompt
         )
-        return response.output_text.strip()
 
     # ---------------------------------------------------------------
     # 4. Broad workbook question
@@ -984,8 +1102,6 @@ Do not invent information.
         )
 
     model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
-    client = _client()
-
     prompt = f"""
 Operator question:
 {q}
@@ -1015,13 +1131,7 @@ Rules:
 - Keep the answer concise but useful, with a small table/list when that makes the answer clearer.
 """
 
-    response = client.responses.create(
-        model=model,
-        instructions=SYSTEM_PROMPT,
-        input=prompt
-    )
-
-    return response.output_text.strip()
+    return _llm_complete(prompt=prompt, system_prompt=SYSTEM_PROMPT, model=model)
 
 
 # -------------------------------------------------------------------
@@ -1029,22 +1139,34 @@ Rules:
 # -------------------------------------------------------------------
 
 def fallback_root_cause(case):
-    m = case.get("metrics", {})
+    m = case.get("metrics", {}) or {}
+    severity = case.get("severity", "Unknown")
+    impact = case.get("impact_score", 0)
+    demand = m.get("demand", 0)
+    usable = m.get("usable_available", m.get("available", 0))
+    on_hand = m.get("on_hand", 0)
+    blocked = m.get("blocked", 0)
+    shortage = m.get("shortage", 0)
+    overdue = m.get("overdue_deliveries", 0)
 
-    return f"""### Root Cause
+    return f"""### Primary Root Cause
 {case.get("root_cause", "The correlated evidence indicates a cross-system operational issue.")}
 
-### Evidence Chain
-The case links Material Master, Inventory_Stock, Warehouse_Bin, Deliveries_Dispatch, Purchase_Replenish, and Vendor_Master using the material/plant/vendor relationships present in the workbook.
+### Evidence
+- Inventory: physical on-hand {on_hand:,.0f}, blocked {blocked:,.0f}, usable available {usable:,.0f}.
+- Demand: active demand {demand:,.0f}; calculated shortage {shortage:,.0f}.
+- Deliveries: {overdue} active delivery record(s) are overdue.
+- Cross-system evidence: the case contains linked Material Master, Inventory, Warehouse Bin, Delivery, Purchase Replenishment and Vendor records.
 
-### Business Impact
-Impact score: {case.get("impact_score", 0)}/100 ({case.get("severity", "Unknown")}). Usable available stock: {m.get("usable_available", m.get("available", 0)):,.0f}; physical on-hand: {m.get("on_hand", 0):,.0f}; blocked: {m.get("blocked", 0):,.0f}; active demand: {m.get("demand", 0):,.0f}; shortage: {m.get("shortage", 0):,.0f}; overdue deliveries: {m.get("overdue_deliveries", 0)}.
+### Impact
+{severity} severity with an impact score of {impact}/100. The primary operational effect is insufficient usable stock against demand, with the linked delivery and capacity risks increasing execution exposure.
 
 ### Recommended Action
-{case.get("recommended_action", "Review the linked records and correct the underlying issue.")}
+{case.get("recommended_action", "Review the linked records and correct the underlying issue before execution.")}
 
 ### Confidence
-High for the observed data relationships; narrative generation is using the deterministic evidence summary because no OpenAI API key is configured."""
+High for the supplied deterministic evidence and linked-record relationships; narrative generation is using the evidence-grounded fallback because VW LLMaaS is unavailable.
+"""
 
 
 def fallback_copilot(question, case):
