@@ -41,14 +41,13 @@ Rules:
 
 
 def get_token() -> str:
-    """Get a VW Group IDP access token using client credentials."""
+    """Get a VW Group IDP access token using the verified client-credentials flow."""
     client_id = _secret("VW_IDP_CLIENT_ID")
     client_secret = _secret("VW_IDP_CLIENT_SECRET")
 
     if not client_id or not client_secret:
         raise RuntimeError(
-            "Missing VW_IDP_CLIENT_ID or VW_IDP_CLIENT_SECRET. "
-            "Configure them in Streamlit Secrets or environment variables."
+            "Missing VW_IDP_CLIENT_ID or VW_IDP_CLIENT_SECRET in Streamlit Secrets."
         )
 
     url = (
@@ -66,29 +65,54 @@ def get_token() -> str:
         },
         timeout=30.0,
     )
+
     if response.status_code != 200:
         detail = ""
         try:
             payload = response.json()
-            detail = str(payload.get("error_description") or payload.get("error") or "").strip()
+            detail = str(
+                payload.get("error_description")
+                or payload.get("error")
+                or ""
+            ).strip()
         except Exception:
-            detail = ""
-        msg = f"VW IDP token request failed (HTTP {response.status_code})."
+            pass
+
+        message = f"Cloud IDP token request failed: HTTP {response.status_code}"
         if detail:
-            msg += f" {detail}"
-        raise RuntimeError(msg)
+            message += f" — {detail}"
+        raise RuntimeError(message)
 
-    token_data = response.json()
-    access_token = token_data.get("access_token")
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Cloud IDP response did not contain access_token.")
 
-    if not access_token:
-        raise RuntimeError("VW IDP did not return an access_token.")
+    return token
 
-    return access_token
+
+def init_llmaas():
+    """Create the verified OpenAI-compatible VW Group LLMaaS client."""
+    from openai import OpenAI
+
+    api_client_id = _secret("LLM_API_CLIENT_ID")
+    if not api_client_id:
+        raise RuntimeError("Missing LLM_API_CLIENT_ID in Streamlit Secrets.")
+
+    token = get_token()
+
+    return OpenAI(
+        api_key=token,
+        base_url=_secret(
+            "LLM_API_BASE_URL",
+            "https://llmapi.ai.vwgroup.com",
+        ),
+        default_headers={
+            "X-LLM-API-CLIENT-ID": f"Bearer {api_client_id}"
+        },
+    )
 
 
 def enabled() -> bool:
-    """Return True when all VW LLMaaS credentials are configured."""
     return bool(
         _secret("VW_IDP_CLIENT_ID")
         and _secret("VW_IDP_CLIENT_SECRET")
@@ -96,32 +120,12 @@ def enabled() -> bool:
     )
 
 
-
 def llm_configured() -> bool:
-    """Public helper for the UI to check whether LLMaaS credentials exist."""
     return enabled()
 
 
 def _client():
-    """Create the OpenAI-compatible VW Group LLMaaS client."""
-    from openai import OpenAI
-
-    token = get_token()
-    llm_api_client_id = _secret("LLM_API_CLIENT_ID")
-    base_url = _secret(
-        "LLM_API_BASE_URL",
-        "https://llmapi.ai.vwgroup.com",
-    )
-
-    headers = {
-        "X-LLM-API-CLIENT-ID": f"Bearer {llm_api_client_id}"
-    }
-
-    return OpenAI(
-        api_key=token,
-        base_url=base_url,
-        default_headers=headers,
-    )
+    return init_llmaas()
 
 
 def _llm_complete(
@@ -129,12 +133,14 @@ def _llm_complete(
     system_prompt: str = SYSTEM_PROMPT,
     model: str | None = None,
 ) -> str:
-    """Send a request to VW Group LLMaaS using Chat Completions."""
+    """Call VW Group LLMaaS using the verified Chat Completions pattern."""
     if not enabled():
-        raise RuntimeError("VW LLMaaS credentials are not configured.")
+        raise RuntimeError(
+            "VW Group LLMaaS is not configured. Configure the VW Group secrets in Streamlit."
+        )
 
-    model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
-    client = _client()
+    client = init_llmaas()
+    model = model or _secret("OPENAI_MODEL", "gpt-4o")
 
     completion = client.chat.completions.create(
         model=model,
@@ -142,81 +148,87 @@ def _llm_complete(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.0,
         stream=False,
+        temperature=0.0,
     )
 
     answer = completion.choices[0].message.content
-
     if not answer:
-        raise RuntimeError("VW LLMaaS returned an empty response.")
+        raise RuntimeError("VW Group LLMaaS returned an empty response.")
 
     return answer.strip()
 
 
-def generate_root_cause(case: dict, model: str | None = None) -> str:
-    """Generate a concise, evidence-grounded RCA decision brief using VW Group LLMaaS."""
+def get_embedding(input_text: str) -> dict:
+    """Create an embedding with the verified embedding model."""
     if not enabled():
         raise RuntimeError(
-            "VW Group LLMaaS is not configured. Set VW_IDP_CLIENT_ID, "
-            "VW_IDP_CLIENT_SECRET, and LLM_API_CLIENT_ID in Streamlit Secrets."
+            "VW Group LLMaaS is not configured. Configure the VW Group secrets in Streamlit."
         )
 
-    model = model or _secret("OPENAI_MODEL", "gpt-4.1-mini")
+    client = init_llmaas()
+    return client.embeddings.create(
+        model="text-embedding-3-large",
+        input=input_text,
+        encoding_format="float",
+    )
+
+
+def generate_root_cause(case: dict, model: str | None = None) -> str:
+    """Generate a concise, evidence-grounded RCA brief using VW Group LLMaaS."""
+    if not enabled():
+        raise RuntimeError(
+            "VW Group LLMaaS is not configured. Configure the VW Group secrets in Streamlit."
+        )
+
+    model = model or _secret("OPENAI_MODEL", "gpt-4o")
 
     prompt = f"""
 Act as a senior warehouse root-cause analyst.
 
-Your job is to transform the supplied correlated case into a concise decision brief for a
-warehouse operator. The workbook evidence is the source of truth.
+Use ONLY the supplied case data and linked workbook evidence.
 
 CASE DATA:
 {json.dumps(case, indent=2, default=str)}
 
-ANALYSIS RULES
-1. Use ONLY the supplied case data and linked workbook records.
-2. Reconcile the relationships across Material_Master, Inventory_Stock, Warehouse_Bin,
-   Deliveries_Dispatch, Purchase_Replenish, and Vendor_Master only when the supplied keys support them.
-3. Preserve exact IDs, quantities, dates, statuses, and field values.
-4. Distinguish:
-   - confirmed facts directly observed in records,
-   - deterministic calculations,
-   - the inferred primary root cause,
-   - contributing factors and symptoms.
-5. Do not invent missing data.
-6. Do not repeat the same evidence in multiple sections.
-7. For inventory, clearly distinguish physical on-hand, blocked quantity, usable available quantity,
-   inbound quantity, demand, and shortage.
-8. Recommendations are proposals only. Never claim an action has already been executed.
-9. Keep the language direct, operational, and easy to scan.
-10. Prefer concrete statements such as:
-    "Demand is 235 while usable stock is 0, creating a 235-unit shortage."
-    Do not use vague phrases such as "there appears to be an issue."
+Create a concise operator-facing decision brief.
 
-OUTPUT FORMAT
+Rules:
+1. Preserve exact IDs, quantities, statuses, and dates from the supplied evidence.
+2. Do not invent missing information.
+3. Clearly distinguish physical on-hand, blocked stock, usable available stock,
+   demand, shortage, inbound, delivery status, warehouse capacity, and vendor/PO status.
+4. Do not simply copy the supplied root_cause field. Rewrite it into a clear causal chain.
+5. Identify one primary root cause and separate contributing factors.
+6. Recommendations are proposals only.
+7. Keep the response short and easy to scan.
+
 Return exactly:
 
 ### Primary Root Cause
-One concise paragraph of 1–3 sentences. State the main causal chain using the most important
-confirmed values. Do NOT merely copy the existing `root_cause` text; compress and clarify it.
+1–3 sentences explaining the main causal chain and the most important quantities.
 
-### Evidence
-Use 3–5 bullet points. Each bullet should contain one concrete fact and, when available,
-the source sheet and relevant ID/field.
+### Contributing Factors
+3–5 bullets with concrete supporting facts.
 
-### Impact
-One concise paragraph containing the most important operational impact, including the supplied
-impact score/severity and the key shortage/delivery/capacity consequence.
+### Operational Impact
+1 short paragraph describing the operational effect supported by the evidence.
 
 ### Recommended Action
-One concise sentence or two short bullets. Actions must be proposed, not described as completed.
+1–2 concise proposed actions.
 
 ### Confidence
-One sentence: High / Medium / Low, with a brief reason based on evidence coverage.
+High, Medium, or Low with one short reason.
 
-Do not add any other headings, introduction, conclusion, or disclaimer.
+Do not add any other sections.
 """
-    return _llm_complete(prompt=prompt, system_prompt=SYSTEM_PROMPT, model=model)
+
+    return _llm_complete(
+        prompt=prompt,
+        system_prompt=SYSTEM_PROMPT,
+        model=model,
+    )
+
 
 
 def _load_copilot_workbook():
